@@ -4,317 +4,325 @@ import pandas as pd
 import time
 import yfinance as yf
 import numpy as np
-import concurrent.futures  # 引入并发库
+import concurrent.futures
+import re
 
 # ==========================================
-# 🔧 1. 数据源适配层 (保持不变)
+# 🔧 1. 智能输入 & 缓存层 (核心优化)
 # ==========================================
 
-def get_history_data(code, market):
+def clean_stock_codes(raw_text, market):
+    """智能清洗函数"""
+    if not raw_text: return []
+    text = raw_text.replace("\n", ",").replace("\t", ",").replace(" ", ",").replace("，", ",")
+    tokens = [x.strip() for x in text.split(",") if x.strip()]
+    valid_codes = []
+    
+    for token in tokens:
+        clean_token = token.upper().replace("SH.", "").replace("SZ.", "").replace("HK.", "").replace("US.", "")
+        clean_token = clean_token.replace(".SH", "").replace(".SZ", "").replace(".HK", "").replace(".US", "")
+        
+        if market == "A股 (沪深)":
+            match = re.search(r'\d{6}', clean_token)
+            if match: valid_codes.append(match.group())
+        elif market == "港股":
+            match = re.search(r'\d{4,5}', clean_token)
+            if match: valid_codes.append(match.group())
+        elif market == "美股":
+            if clean_token.isalpha() and len(clean_token) <= 5:
+                valid_codes.append(clean_token)
+
+    return list(dict.fromkeys(valid_codes))
+
+# === 核心：数据缓存 (TTL设为12小时) ===
+# 即使你切出去2小时再回来，只要不重启服务器，之前下载过的数据都会秒读
+@st.cache_data(ttl=43200, show_spinner=False)
+def get_history_data_cached(code, market):
     """
-    统一获取 A/港/美 股的历史K线数据
+    带缓存的数据获取函数。
     """
     df = pd.DataFrame()
     try:
         if market == "A股 (沪深)":
-            # A股使用 Akshare 接口，adjust="qfq" 代表前复权，消除分红影响
             df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date="20240101", adjust="qfq")
         elif market == "港股":
-            # 港股需要拼接 .HK 后缀
-            yf_code = f"{int(code):04d}.HK"
-            data = yf.download(yf_code, start="2024-01-01", progress=False, auto_adjust=True)
+            code_str = str(code).zfill(4)
+            if not code_str.endswith(".HK"): code_str = f"{code_str}.HK"
+            data = yf.download(code_str, start="2024-01-01", progress=False, auto_adjust=True)
             if not data.empty:
                 df = data.reset_index()
-                df = df[['Date', 'Close', 'High', 'Low']]
-                df.columns = ['日期', '收盘', '最高', '最低']
+                df = df[['Date', 'Close', 'High', 'Low', 'Volume']]
+                df.columns = ['日期', '收盘', '最高', '最低', '成交量']
         elif market == "美股":
-            # 美股直接使用代码
-            yf_code = code
-            data = yf.download(yf_code, start="2024-01-01", progress=False, auto_adjust=True)
+            data = yf.download(code, start="2024-01-01", progress=False, auto_adjust=True)
             if not data.empty:
                 df = data.reset_index()
-                df = df[['Date', 'Close', 'High', 'Low']]
-                df.columns = ['日期', '收盘', '最高', '最低']
-    except Exception:
-        pass
+                df = df[['Date', 'Close', 'High', 'Low', 'Volume']]
+                df.columns = ['日期', '收盘', '最高', '最低', '成交量']
+    except: pass
     return df
 
 # ==========================================
-# 🧠 2. 核心量化算法 (保持不变，仅增加注释)
+# 🧠 2. 指标计算 & 策略
 # ==========================================
 
 def calculate_indicators(df):
-    """
-    计算技术指标
-    MACD (12, 26, 9)
-    RSI (14)
-    KDJ (9, 3, 3)
-    BOLL (20, 2)
-    """
-    # 必须按日期升序排列，否则指标计算会反向
+    if df.empty: return df
     df = df.sort_values(by='日期', ascending=True).reset_index(drop=True)
-    close = df['收盘']
-    low = df['最低']
-    high = df['最高']
     
-    # --- 1. MACD (异同移动平均线) ---
-    # 参数: 快线=12, 慢线=26, 信号线=9
+    close = df['收盘']
+    volume = df['成交量']
+    
+    # 均线
+    df['ma5'] = close.rolling(5).mean()
+    df['ma10'] = close.rolling(10).mean()
+    df['ma20'] = close.rolling(20).mean()
+    df['ma60'] = close.rolling(60).mean()
+
+    # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     df['dif'] = ema12 - ema26
     df['dea'] = df['dif'].ewm(span=9, adjust=False).mean()
-    df['macd'] = (df['dif'] - df['dea']) * 2
+    df['macd_bar'] = (df['dif'] - df['dea']) * 2
 
-    # --- 2. RSI (相对强弱指标) ---
-    # 参数: 周期=14
+    # RSI
     delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
 
-    # --- 3. KDJ (随机指标) ---
-    # 参数: 周期=9, K平滑=3, D平滑=3
-    low_min = low.rolling(window=9).min()
-    high_max = high.rolling(window=9).max()
-    rsv = (close - low_min) / (high_max - low_min) * 100
-    df['k'] = rsv.ewm(com=2, adjust=False).mean()
-    df['d'] = df['k'].ewm(com=2, adjust=False).mean()
-    
-    # --- 4. BOLL (布林带) ---
-    # 参数: 周期=20, 宽度=2倍标准差
-    df['boll_mid'] = close.rolling(window=20).mean()
-    df['boll_std'] = close.rolling(window=20).std()
+    # BOLL
+    df['boll_mid'] = close.rolling(20).mean()
+    df['boll_std'] = close.rolling(20).std()
     df['boll_upper'] = df['boll_mid'] + 2 * df['boll_std']
-    
+    df['boll_lower'] = df['boll_mid'] - 2 * df['boll_std']
+    df['boll_width'] = (df['boll_upper'] - df['boll_lower']) / df['boll_mid']
+
+    # OBV
+    df['obv'] = (np.sign(close.diff()) * volume).fillna(0).cumsum()
+    df['obv_ma20'] = df['obv'].rolling(20).mean()
+
+    # 量
+    df['vol_ma20'] = volume.rolling(20).mean()
+    df['vol_ratio'] = volume / df['vol_ma20']
+
     return df
 
-def check_technical_signals(code, market, strategies):
-    """
-    根据选定的策略检查股票
-    """
-    df = get_history_data(code, market)
-    # 如果数据少于60天，无法准确计算 MACD 背离等长周期指标，直接跳过
-    if df.empty or len(df) < 60: return False
+# --- 策略函数 ---
+def check_macd_bar_divergence(df, window=30):
+    if len(df) < window + 5: return False
+    recent = df.iloc[-window:]
+    if recent['最低'].iloc[-1] > recent['最低'].min() * 1.01: return False 
+    if recent['macd_bar'].iloc[-1] > 0: return False
+    curr_bar_min = recent['macd_bar'].iloc[-5:].min()
+    prev_bars = recent['macd_bar'].iloc[:-10]
+    if len(prev_bars[prev_bars < 0]) == 0: return False
+    return curr_bar_min > prev_bars.min()
+
+def check_ma_alignment(df):
+    c = df.iloc[-1]
+    return (c['ma5'] > c['ma10']) and (c['ma10'] > c['ma20']) and (c['ma20'] > c['ma60'])
+
+def check_vcp_pattern(df):
+    if len(df) < 60: return False
+    w1 = df['boll_width'].iloc[-20:].mean()
+    w2 = df['boll_width'].iloc[-40:-20].mean()
+    return (w1 < w2 * 0.9) and (df['成交量'].iloc[-1] < df['vol_ma20'].iloc[-1])
+
+def check_boll_squeeze_breakout(df):
+    if len(df) < 22: return False
+    curr = df.iloc[-1]
+    if not (curr['收盘'] > curr['boll_upper']): return False
+    past_width = df['boll_width'].iloc[-10:-1].mean()
+    return (curr['boll_width'] > past_width * 1.1) and (curr['成交量'] > curr['vol_ma20'] * 1.5)
+
+def check_obv_trend(df):
+    if len(df) < 20: return False
+    curr = df.iloc[-1]
+    return (curr['obv'] > curr['obv_ma20']) and (curr['obv'] > df['obv'].iloc[-5])
+
+# --- 调度器 ---
+def check_technical_signals(code, market, strategies, lookback_days):
+    # 使用带缓存的函数
+    df = get_history_data_cached(code, market)
+    
+    if df.empty or len(df) < 60: return (False, None)
     
     df = calculate_indicators(df)
-    curr = df.iloc[-1] # 当日数据
-    prev = df.iloc[-2] # 昨日数据
     
-    results = []
-    try:
-        # MACD 金叉: 当日 DIF > DEA 且 昨日 DIF < DEA
-        if 'macd_gold' in strategies:
-            results.append((curr['dif'] > curr['dea']) and (prev['dif'] < prev['dea']))
+    for i in range(lookback_days):
+        end_idx = -1 - i
+        if end_idx == -1: current_slice = df
+        else: current_slice = df.iloc[:end_idx+1]
         
-        # RSI 超卖: RSI 数值小于 30，通常视为反弹信号
-        if 'rsi_oversold' in strategies:
-            results.append(curr['rsi'] < 30)
-            
-        # KDJ 金叉: K线上穿D线
-        if 'kdj_gold' in strategies:
-            results.append((curr['k'] > curr['d']) and (prev['k'] < prev['d']))
-            
-        # 布林带突破: 收盘价站上布林上轨，通常为强势单边行情的开始
-        if 'boll_breakup' in strategies:
-            results.append(curr['收盘'] > curr['boll_upper'])
-            
-        # MACD 底背离: 股价创近20日新低，但MACD的DIF值未创新低
-        if 'macd_div' in strategies:
-            window = 20
-            is_price_low = curr['收盘'] <= df['收盘'].tail(window).min()
-            is_dif_higher = curr['dif'] > df['dif'].tail(window).min()
-            is_underwater = curr['dif'] < 0 # 必须在零轴下方
-            results.append(is_price_low and is_dif_higher and is_underwater)
-            
-        return all(results)
-    except:
-        return False
+        if len(current_slice) < 60: continue
+        
+        daily_res = []
+        try:
+            if 'macd_bar_div' in strategies: daily_res.append(check_macd_bar_divergence(current_slice))
+            if 'rsi_oversold' in strategies: daily_res.append(current_slice.iloc[-1]['rsi'] < 30)
+            if 'ma_alignment' in strategies: daily_res.append(check_ma_alignment(current_slice))
+            if 'vcp_squeeze' in strategies: daily_res.append(check_vcp_pattern(current_slice))
+            if 'boll_breakout' in strategies: daily_res.append(check_boll_squeeze_breakout(current_slice))
+            if 'macd_gold' in strategies:
+                c = current_slice.iloc[-1]; p = current_slice.iloc[-2]
+                daily_res.append((c['dif'] > c['dea']) and (p['dif'] < p['dea']))
+            if 'obv_trend' in strategies: daily_res.append(check_obv_trend(current_slice))
+
+            if all(daily_res): return (True, current_slice.iloc[-1])
+        except: continue
+        
+    return (False, None)
 
 # ==========================================
-# 🖥️ 3. UI 交互层 (包含详细 Help 提示)
+# 🖥️ 4. UI (防手滑表单版)
 # ==========================================
 
-st.set_page_config(page_title="全球量化选股 Turbo", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Alpha Analyzer Mobile", page_icon="🦅", layout="wide")
 st.markdown("<style>.stProgress > div > div > div > div { background-color: #f63366; }</style>", unsafe_allow_html=True)
 
-st.title("⚡ 全球量化选股 (Turbo版)")
-st.caption("A股/港股/美股 | 多线程并发 | 混合引擎")
-st.markdown("---")
+st.title("🦅 Alpha Analyzer (移动端适配版)")
 
-with st.sidebar:
-    st.header("1️⃣ 市场与基础筛选")
-    market = st.selectbox("目标市场", ("A股 (沪深)", "港股", "美股"))
-    
-    if market == "A股 (沪深)":
-        limit = (-20.0, 20.0); default = (3.0, 9.0)
-    else:
-        limit = (-100.0, 100.0); default = (5.0, 20.0)
-    pct_range = st.slider("涨跌幅 (%)", limit[0], limit[1], default)
-    
-    st.subheader("📊 进阶基本面 (若有数据)")
-    
-    turnover_min = st.number_input(
-        "最小换手率 (%)", 
-        value=0.0, 
-        step=1.0,
-        help="推荐设置：\n- 3%~7%: 交易活跃，人气正常\n- 7%~15%: 强势股特征\n- >15%: 极度活跃或主力出货风险"
-    )
-    
-    amount_min = st.number_input(
-        "最小成交额 (万元)", 
-        value=0, 
-        step=1000,
-        help="过滤流动性指标：\n- 输入 10000 (1亿): 过滤掉大部分垃圾股和冷门股\n- 输入 50000 (5亿): 筛选机构和大资金关注的流动性充沛标的\n*注：该数值直接对应筛选单位，美股/港股建议根据实际体量调整"
-    )
-    
-    vr_min = st.number_input(
-        "最小量比", 
-        value=0.0, 
-        step=0.1,
-        help="量比衡量相对成交量：\n- > 1.0: 放量，交易比平时活跃\n- > 2.0: 明显放量，可能有主力资金介入\n- 推荐设置 1.5 左右作为门槛"
-    )
-    
-    pe_max = st.number_input(
-        "最大市盈率 (PE)", 
-        value=0, 
-        step=10,
-        help="估值指标：\n- < 30: 价值股/低估值区域\n- 30~60: 成长股常见区间\n- 输入 0 表示不限制"
-    )
+# 初始化 Session State
+if 'scan_results' not in st.session_state: st.session_state['scan_results'] = None
+if 'scan_market' not in st.session_state: st.session_state['scan_market'] = ""
+if 'scan_time' not in st.session_state: st.session_state['scan_time'] = ""
 
-    st.markdown("---")
-    
-    st.header("2️⃣ 技术信号")
-    use_tech = st.checkbox("启用技术指标筛选", value=False)
-    
-    strategies = []
-    if use_tech:
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.checkbox("MACD 金叉", help="DIF 上穿 DEA (12,26,9)"): strategies.append('macd_gold')
-            if st.checkbox("MACD 底背离 🔥", help="股价创新低但MACD指标未创新低，强力抄底信号"): strategies.append('macd_div')
-            if st.checkbox("RSI 超卖 (<30)", help="RSI(14) 进入超卖区，存在反弹需求"): strategies.append('rsi_oversold')
-        with c2:
-            if st.checkbox("KDJ 金叉", help="K线 上穿 D线 (9,3,3)"): strategies.append('kdj_gold')
-            if st.checkbox("突破布林上轨", help="收盘价站上布林带(20,2)上轨，强势特征"): strategies.append('boll_breakup')
+tab_scan, tab_help = st.tabs(["🚀 策略扫描", "📖 筛选标准与指南"])
 
-    st.markdown("---")
-    start_btn = st.button("🚀 开始极速扫描", type="primary", use_container_width=True)
+# ===================== Tab 1: 扫描 =====================
+with tab_scan:
+    # 🌟 核心：使用 st.form 锁住所有交互，防止误触刷新
+    with st.form("mobile_scanner_form"):
+        st.caption("📱 手机端优化：所有设置调整后，必须点击最下方【开始分析】才会运行。")
+        
+        col_input, col_settings = st.columns([1, 1])
+        
+        with col_input:
+            st.subheader("1. 股票池导入")
+            market = st.selectbox("市场选择", ("A股 (沪深)", "港股", "美股"))
+            raw_codes = st.text_area("📋 粘贴代码 (Moomoo/同花顺)", height=200, 
+                placeholder="直接粘贴代码...\nUS.NVDA\n00700\n600519",
+                help="自动清洗代码，无视格式。")
 
-# 封装多线程任务
-def process_stock_task(args):
-    code, mkt, strats = args
-    if check_technical_signals(str(code), mkt, strats):
-        return code
-    return None
-
-if start_btn:
-    with st.spinner(f"正在拉取 {market} 实时数据..."):
-        df = pd.DataFrame()
-        if market == "A股 (沪深)":
-            df = ak.stock_zh_a_spot_em()
-            df = df[~df['名称'].str.contains('ST|退')]
-        elif market == "港股":
-            df = ak.stock_hk_spot_em()
-        elif market == "美股":
-            df = ak.stock_us_spot_em()
-    
-    if not df.empty:
-        # === 核心修正 1: 智能列名映射与类型转换 ===
-        exclude_cols = ['代码', 'code', 'symbol', '名称', 'name', 'cname']
-        
-        for col in df.columns:
-            if col in exclude_cols: continue 
-            try: df[col] = pd.to_numeric(df[col], errors='ignore')
-            except: pass
-        
-        # 映射列名
-        pct_col = '涨跌幅' if '涨跌幅' in df.columns else 'diff_rate'
-        
-        # 强制清洗
-        df = df.dropna(subset=[pct_col])
-        df[pct_col] = pd.to_numeric(df[pct_col], errors='coerce')
-        
-        # 基础过滤
-        mask = (df[pct_col] >= pct_range[0]) & (df[pct_col] <= pct_range[1])
-        
-        amt_col = '成交额' if '成交额' in df.columns else 'amount'
-        if amt_col in df.columns and amount_min > 0:
-            # 这里的单位转换逻辑：A股输入单位是万元，所以需要 *10000 还原为元进行比较
-            limit_val = amount_min * 10000 if market == "A股 (沪深)" else amount_min
-            mask = mask & (df[amt_col] >= limit_val)
+        with col_settings:
+            st.subheader("2. 策略引擎")
+            lookback_days = st.slider("信号回溯 (天)", 1, 10, 3)
             
-        to_col = '换手率' if '换手率' in df.columns else 'turnover'
-        if to_col in df.columns and turnover_min > 0:
-            mask = mask & (df[to_col] >= turnover_min)
-            
-        vr_col = '量比'
-        if vr_col in df.columns and vr_min > 0:
-            mask = mask & (df[vr_col] >= vr_min)
-            
-        pe_col = '市盈率-动态'
-        if pe_col in df.columns and pe_max > 0:
-            mask = mask & (df[pe_col] <= pe_max) & (df[pe_col] > 0)
-
-        filtered_df = df[mask].copy()
-        
-        # 技术筛选
-        final_df = filtered_df
-        if use_tech and strategies:
-            max_check = 200 if market == "A股 (沪深)" else 100
-            check_list = filtered_df.head(max_check)
-            
-            code_col = '代码' if '代码' in df.columns else 'symbol'
-            if code_col not in check_list.columns: code_col = 'code'
-            
-            codes_to_check = check_list[code_col].tolist()
-            st.info(f"🚀 正在并发分析 {len(codes_to_check)} 只股票...")
-            
-            start_time = time.time()
-            task_args = [(c, market, strategies) for c in codes_to_check]
-            
-            # 使用10个线程并发，提高速度
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                results = executor.map(process_stock_task, task_args)
-            
-            valid_codes = [r for r in results if r is not None]
-            end_time = time.time()
-            st.caption(f"⚡ 技术分析耗时: {end_time - start_time:.2f} 秒")
-                    
-            final_df = filtered_df[filtered_df[code_col].isin(valid_codes)]
-
-        # === 核心修正 2: 结果展示前的数据清洗 ===
-        st.success(f"筛选完成！命中 {len(final_df)} 只")
-        
-        # A. 修复代码前导零 (只针对A股)
-        code_col = '代码' if '代码' in final_df.columns else 'symbol'
-        if market == "A股 (沪深)" and code_col in final_df.columns:
-            final_df[code_col] = final_df[code_col].apply(lambda x: f"{int(x):06d}" if str(x).isdigit() else x)
-
-        # B. 优化成交额显示 (转为亿元)
-        amt_raw_col = '成交额' if '成交额' in final_df.columns else 'amount'
-        display_amt_col = amt_raw_col 
-        
-        if amt_raw_col in final_df.columns:
-            new_col_name = '成交额(亿)'
-            # 将原始数值除以1亿，方便阅读。对于美股/港股，这里显示的是 亿美元/亿港币
-            final_df[new_col_name] = (final_df[amt_raw_col] / 100000000).round(2)
-            display_amt_col = new_col_name 
-
-        # 设置展示列
-        display_cols = []
-        priority = [code_col, '名称', 'name', '最新价', 'price', '涨跌幅', 'diff_rate', 
-                   display_amt_col, '换手率', '量比', '市盈率-动态']
-        
-        for c in priority:
-            if c in final_df.columns:
-                display_cols.append(c)
+            strategies = []
+            with st.expander("🅰️ 左侧抄底 (Reversal)", expanded=True):
+                if st.checkbox("MACD 柱状体底背离"): strategies.append('macd_bar_div')
+                if st.checkbox("RSI 超卖 (<30)"): strategies.append('rsi_oversold')
                 
-        st.dataframe(final_df[display_cols].head(100), use_container_width=True)
+            with st.expander("🅱️ 右侧追涨 (Trend)", expanded=True):
+                if st.checkbox("均线多头 (MA5>10>20>60)"): strategies.append('ma_alignment')
+                if st.checkbox("VCP 波动收缩"): strategies.append('vcp_squeeze')
+                if st.checkbox("布林收口真突破"): strategies.append('boll_breakout')
+                if st.checkbox("MACD 金叉"): strategies.append('macd_gold')
+                
+            with st.expander("📊 辅助确认", expanded=True):
+                if st.checkbox("OBV 能量潮向上 🔥"): strategies.append('obv_trend')
+
+        st.markdown("---")
+        # 🌟 唯一的触发按钮
+        submit_btn = st.form_submit_button("🚀 开始深度分析 (断点续传)", type="primary", use_container_width=True)
+
+    # 逻辑处理
+    if submit_btn:
+        if not raw_codes.strip(): st.error("请粘贴股票代码！")
+        else:
+            code_list = clean_stock_codes(raw_codes, market)
+            if not code_list: st.error("无有效代码。")
+            else:
+                # 进度条
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                status_text.info(f"⏳ 正在分析 {len(code_list)} 只标的 (缓存加速中)...")
+                
+                # 任务封装
+                def process_task(args):
+                    c, m, s, d = args
+                    # 这里的 cache 生效：如果之前切屏了，这里的 get_history_data 会秒回
+                    is_hit, snapshot = check_technical_signals(str(c), m, s, d)
+                    return (c, is_hit, snapshot)
+
+                start_time = time.time()
+                task_args = [(c, market, strategies, lookback_days) for c in code_list]
+                
+                valid_data = []
+                
+                # 使用普通循环来更新进度条 (ThreadPool 进度条不好做)
+                # 或者使用 as_completed
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    futures = {executor.submit(process_task, arg): arg for arg in task_args}
+                    
+                    for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                        c, is_hit, snapshot = future.result()
+                        if is_hit:
+                            valid_data.append({
+                                "代码": c,
+                                "最新价": round(snapshot['收盘'], 2),
+                                "RSI值": round(snapshot['rsi'], 1),
+                                "量比": round(snapshot['vol_ratio'], 1),
+                                "布林带宽": round(snapshot['boll_width'], 3),
+                                "OBV趋势": "⬆️" if snapshot['obv'] > snapshot['obv_ma20'] else "⬇️"
+                            })
+                        # 更新进度条
+                        progress_bar.progress((i + 1) / len(code_list))
+                
+                end_time = time.time()
+                progress_bar.empty() # 跑完隐藏进度条
+                
+                # 存入 Session
+                st.session_state['scan_results'] = valid_data
+                st.session_state['scan_market'] = market
+                st.session_state['scan_time'] = f"{end_time - start_time:.2f}s"
+                
+                status_text.empty()
+
+    # 结果展示
+    if st.session_state['scan_results'] is not None:
+        data = st.session_state['scan_results']
+        mkt = st.session_state['scan_market']
         
-        if code_col in final_df.columns:
-            st.subheader("📋 代码列表")
-            st.code(",".join(final_df[code_col].astype(str).tolist()))
-        
-    else:
-        st.error("未获取到行情数据。")
+        if data:
+            st.success(f"🎯 命中 {len(data)} 只 (耗时 {st.session_state['scan_time']})")
+            df_res = pd.DataFrame(data)
+            if mkt == "A股 (沪深)":
+                df_res['代码'] = df_res['代码'].apply(lambda x: f"{int(x):06d}" if str(x).isdigit() else x)
+            
+            st.dataframe(df_res, use_container_width=True)
+            st.code(",".join(df_res['代码'].astype(str).tolist()))
+        else:
+            st.warning("🍂 无股票命中。")
+
+# ===================== Tab 2: 指南 =====================
+with tab_help:
+    st.markdown("""
+    ## 📖 移动端使用技巧
+    
+    ### 1. 为什么切屏会停止？
+    手机浏览器为了省电，切到后台会断网。这是正常现象。
+    
+    ### 2. 怎么“断点续传”？
+    本工具已内置**12小时数据缓存**。
+    * 如果你跑了一半切出去了，回来刷新页面。
+    * **再次点击“开始分析”**。
+    * 你会发现进度条“嗖”的一下跑完之前的部分，因为数据已经存下来了。
+    
+    ### 3. Moomoo 筛选参数 (SOP)
+    
+    #### 🅰️ 左侧交易 (找超跌)
+    * **A股**: 市值>100亿 | 价格<20日线 | RSI<40
+    * **美/港**: 市值>50亿/200亿 | 价格<20日线 | RSI<40
+    * **本工具策略**: `MACD底背离` + `RSI超卖`
+
+    #### 🅱️ 右侧交易 (找主升)
+    * **A股**: 市值>50亿 | 价格>60日线 | 换手>3%
+    * **美/港**: 市值>20亿/100亿 | 价格>60日线 | 成交额>1千万/3千万
+    * **本工具策略**: 
+        * **稳健**: `均线多头` + `VCP收缩` + `OBV向上`
+        * **激进**: `布林真突破` + `MACD金叉`
+    """)
