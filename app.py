@@ -308,49 +308,42 @@ with tab_scan:
                 st.warning(f"⚠️ 正在扫描 {len(code_list)} 只 {market} 股票，请耐心等待。")
 
             status_text.info(f"⏳ 正在分析 {len(code_list)} 只标的...")
-                
-                # 任务封装
-                def process_task(args):
-                    c, m, s, d = args
-                    # 这里的 cache 生效：如果之前切屏了，这里的 get_history_data 会秒回
-                    is_hit, snapshot = check_technical_signals(str(c), m, s, d)
-                    return (c, is_hit, snapshot)
+            
+            def process_task(args):
+                c, m, s, d = args
+                is_hit, snapshot = check_technical_signals(str(c), m, s, d)
+                return (c, is_hit, snapshot)
+            # -----------------------------------------------------------
 
-                start_time = time.time()
-                task_args = [(c, market, strategies, lookback_days) for c in code_list]
-                
-                valid_data = []
-                
-                # 使用普通循环来更新进度条 (ThreadPool 进度条不好做)
-                # 或者使用 as_completed
-                # 限制最大并发数，保护接口
-                max_workers = 10 if market == "A股 (沪深)" else 5
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {executor.submit(process_task, arg): arg for arg in task_args}
-                    
-                    for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                        c, is_hit, snapshot = future.result()
-                        if is_hit:
-                            valid_data.append({
-                                "代码": c,
-                                "最新价": round(snapshot['收盘'], 2),
-                                "RSI值": round(snapshot['rsi'], 1),
-                                "量比": round(snapshot['vol_ratio'], 1),
-                                "布林带宽": round(snapshot['boll_width'], 3),
-                                "OBV趋势": "⬆️" if snapshot['obv'] > snapshot['obv_ma20'] else "⬇️"
-                            })
-                        # 更新进度条
-                        progress_bar.progress((i + 1) / len(code_list))
-                
-                end_time = time.time()
-                progress_bar.empty() # 跑完隐藏进度条
-                
-                # 存入 Session
-                st.session_state['scan_results'] = valid_data
-                st.session_state['scan_market'] = market
-                st.session_state['scan_time'] = f"{end_time - start_time:.2f}s"
-                
-                status_text.empty()
+            start_time = time.time()
+            task_args = [(c, market, strategies, lookback_days) for c in code_list]
+            
+            valid_data = []
+            # 动态调整并发
+            max_workers = 10 if market == "A股 (沪深)" else 5 
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(process_task, arg): arg for arg in task_args}
+                for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                    c, is_hit, snapshot = future.result()
+                    if is_hit:
+                        valid_data.append({
+                            "代码": c,
+                            "最新价": round(snapshot['收盘'], 2),
+                            "RSI值": round(snapshot['rsi'], 1),
+                            "量比": round(snapshot['vol_ratio'], 1),
+                            "布林带宽": round(snapshot['boll_width'], 3),
+                            "OBV趋势": "⬆️" if snapshot['obv'] > snapshot['obv_ma20'] else "⬇️"
+                        })
+                    progress_bar.progress((i + 1) / len(code_list))
+            
+            end_time = time.time()
+            progress_bar.empty()
+            
+            st.session_state['scan_results'] = valid_data
+            st.session_state['scan_market'] = market
+            st.session_state['scan_time'] = f"{end_time - start_time:.2f}s"
+            status_text.empty()
 
     # 结果展示
     if st.session_state['scan_results'] is not None:
@@ -377,8 +370,8 @@ with tab_help:
     ### 1. 业务流程 (Workflow)
     * **Step 1 (PC端 Moomoo)**: 使用选股器选股 -> `Ctrl+A` 全选 -> 导出列表。
     * **Step 2 (本工具)**: 上传导出的文件 -> 选择【左侧】或【右侧】策略 -> 运行筛选。
-    * **Step 3 **: 复制本工具筛选出的精选代码 -> 填入 Daily Stock Analysis -> 运行进一步的分析。
-    * **Step 4 **: 在飞书/Lark查看 AI 研报。
+    * **Step 3**: 复制本工具筛选出的精选代码 -> 填入 Daily Stock Analysis -> 运行进一步的分析。
+    * **Step 4**: 在飞书/Lark查看 AI 研报。
     
     ### 2. Moomoo 选股器参数 (SOP)
     
