@@ -6,9 +6,10 @@ import yfinance as yf
 import numpy as np
 import concurrent.futures
 import re
+import io
 
 # ==========================================
-# 🔧 1. 智能输入 & 缓存层 (核心优化)
+# 🔧 1. 数据源处理 (新增文件解析)
 # ==========================================
 
 def clean_stock_codes(raw_text, market):
@@ -17,8 +18,52 @@ def clean_stock_codes(raw_text, market):
     text = raw_text.replace("\n", ",").replace("\t", ",").replace(" ", ",").replace("，", ",")
     tokens = [x.strip() for x in text.split(",") if x.strip()]
     valid_codes = []
+    return process_raw_tokens(tokens, market)
     
+def process_file_upload(uploaded_file, market):
+    """文件解析：支持 CSV / Excel"""
+    codes = []
+    try:
+        df = pd.DataFrame()
+        # 1. 读取文件
+        if uploaded_file.name.endswith('.csv'):
+            try:
+                df = pd.read_csv(uploaded_file)
+            except UnicodeDecodeError:
+                # 尝试 GBK (Moomoo 导出的 CSV 常见编码)
+                uploaded_file.seek(0)
+                df = pd.read_csv(uploaded_file, encoding='gbk')
+        else:
+            df = pd.read_excel(uploaded_file)
+        
+        # 2. 寻找代码列
+        # Moomoo 导出通常叫 "代码", Yahoo 叫 "Symbol", 英文叫 "Code"
+        target_col = None
+        possible_names = ['代码', 'Code', 'Symbol', '股票代码', 'symbol', 'code']
+        
+        for col in df.columns:
+            if col.strip() in possible_names:
+                target_col = col
+                break
+        
+        # 如果没找到同名列，尝试找第一列看起来像代码的
+        if target_col is None:
+            target_col = df.columns[0] # 盲猜第一列
+            
+        # 3. 提取并转为字符串
+        if target_col:
+            raw_list = df[target_col].astype(str).tolist()
+            return process_raw_tokens(raw_list, market)
+            
+    except Exception as e:
+        st.error(f"文件解析失败: {e}")
+    return codes
+
+def process_raw_tokens(tokens, market):
+    """统一的正则提取逻辑"""
+    valid_codes = []
     for token in tokens:
+        # 去除前缀后缀
         clean_token = token.upper().replace("SH.", "").replace("SZ.", "").replace("HK.", "").replace("US.", "")
         clean_token = clean_token.replace(".SH", "").replace(".SZ", "").replace(".HK", "").replace(".US", "")
         
@@ -29,9 +74,10 @@ def clean_stock_codes(raw_text, market):
             match = re.search(r'\d{4,5}', clean_token)
             if match: valid_codes.append(match.group())
         elif market == "美股":
+            # 排除纯数字
             if clean_token.isalpha() and len(clean_token) <= 5:
                 valid_codes.append(clean_token)
-
+    
     return list(dict.fromkeys(valid_codes))
 
 # === 核心：数据缓存 (TTL设为12小时) ===
@@ -177,13 +223,13 @@ def check_technical_signals(code, market, strategies, lookback_days):
     return (False, None)
 
 # ==========================================
-# 🖥️ 4. UI (防手滑表单版)
+# 🖥️ 4. UI (文件上传版)
 # ==========================================
 
-st.set_page_config(page_title="Alpha Analyzer Mobile", page_icon="🦅", layout="wide")
+st.set_page_config(page_title="Stock Analyzer", page_icon="🦅", layout="wide")
 st.markdown("<style>.stProgress > div > div > div > div { background-color: #f63366; }</style>", unsafe_allow_html=True)
 
-st.title("🦅 Alpha Analyzer (移动端适配版)")
+st.title("🦅 Stock Analyzer")
 
 # 初始化 Session State
 if 'scan_results' not in st.session_state: st.session_state['scan_results'] = None
@@ -195,21 +241,25 @@ tab_scan, tab_help = st.tabs(["🚀 策略扫描", "📖 筛选标准与指南"]
 # ===================== Tab 1: 扫描 =====================
 with tab_scan:
     # 🌟 核心：使用 st.form 锁住所有交互，防止误触刷新
-    with st.form("mobile_scanner_form"):
-        st.caption("📱 手机端优化：所有设置调整后，必须点击最下方【开始分析】才会运行。")
+    with st.form("scanner_form"):
+        st.caption("⚙️ 支持直接上传 Moomoo 导出的 Excel/CSV 文件。")
         
         col_input, col_settings = st.columns([1, 1])
         
         with col_input:
             st.subheader("1. 股票池导入")
             market = st.selectbox("市场选择", ("A股 (沪深)", "港股", "美股"))
-            raw_codes = st.text_area("📋 粘贴代码 (Moomoo/同花顺)", height=200, 
-                placeholder="直接粘贴代码...\nUS.NVDA\n00700\n600519",
-                help="自动清洗代码，无视格式。")
+            
+            # === 新增：文件上传控件 ===
+            uploaded_file = st.file_uploader("📂 上传 Moomoo 导出文件 (Excel/CSV)", type=['xlsx', 'csv'])
+            
+            raw_codes = st.text_area("📋 或直接粘贴代码", height=100, 
+                placeholder="US.NVDA\n00700\n600519",
+                help="如果不想上传文件，也可以手动粘贴。")
 
         with col_settings:
             st.subheader("2. 策略引擎")
-            lookback_days = st.slider("信号回溯 (天)", 1, 10, 3)
+            lookback_days = st.slider("信号回溯 (天)", 1, 5, 3)
             
             strategies = []
             with st.expander("🅰️ 左侧抄底 (Reversal)", expanded=True):
@@ -227,19 +277,37 @@ with tab_scan:
 
         st.markdown("---")
         # 🌟 唯一的触发按钮
-        submit_btn = st.form_submit_button("🚀 开始深度分析 (断点续传)", type="primary", use_container_width=True)
+        submit_btn = st.form_submit_button("🚀 开始分析", type="primary", use_container_width=True)
 
     # 逻辑处理
     if submit_btn:
-        if not raw_codes.strip(): st.error("请粘贴股票代码！")
+        code_list = []
+        
+        # 1. 处理上传文件
+        if uploaded_file is not None:
+            file_codes = process_file_upload(uploaded_file, market)
+            if file_codes:
+                code_list.extend(file_codes)
+                st.toast(f"从文件中提取到 {len(file_codes)} 个代码")
+        
+        # 2. 处理粘贴文本
+        if raw_codes.strip():
+            text_codes = clean_stock_codes(raw_codes, market)
+            code_list.extend(text_codes)
+        
+        # 去重
+        code_list = list(dict.fromkeys(code_list))
+
+        if not code_list:
+            st.error("未提取到有效代码！请上传文件或粘贴文本。")
         else:
-            code_list = clean_stock_codes(raw_codes, market)
-            if not code_list: st.error("无有效代码。")
-            else:
-                # 进度条
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                status_text.info(f"⏳ 正在分析 {len(code_list)} 只标的 (缓存加速中)...")
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            if market != "A股 (沪深)" and len(code_list) > 300:
+                st.warning(f"⚠️ 正在扫描 {len(code_list)} 只 {market} 股票，请耐心等待。")
+
+            status_text.info(f"⏳ 正在分析 {len(code_list)} 只标的...")
                 
                 # 任务封装
                 def process_task(args):
@@ -307,11 +375,10 @@ with tab_help:
     ## 📖 SOP 标准作业程序
     
     ### 1. 业务流程 (Workflow)
-    * **Step 1 (PC端 Moomoo)**: 使用选股器选股 -> `Ctrl+A` 全选 -> `Ctrl+C` 复制。
-    * **Step 2 (本工具)**: 粘贴代码 -> 选择【左侧】或【右侧】策略 -> 运行筛选。
-    * **Step 3 (GitHub)**: 复制本工具筛选出的精选代码 -> 填入 Daily Stock Analysis 的STOCK LIST -> Action选项中Run Workflow运行。
-    * **Step 4 (手机端)**: 在飞书/Lark查看 AI 研报。
-    * PS：STOCK LIST只会覆盖，每次手动运行后需回填股票代码
+    * **Step 1 (PC端 Moomoo)**: 使用选股器选股 -> `Ctrl+A` 全选 -> 导出列表。
+    * **Step 2 (本工具)**: 上传导出的文件 -> 选择【左侧】或【右侧】策略 -> 运行筛选。
+    * **Step 3 **: 复制本工具筛选出的精选代码 -> 填入 Daily Stock Analysis -> 运行进一步的分析。
+    * **Step 4 **: 在飞书/Lark查看 AI 研报。
     
     ### 2. Moomoo 选股器参数 (SOP)
     
